@@ -12,21 +12,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: deps (imgui + dobby)
+      - name: deps (imgui + And64InlineHook)
         run: |
           git clone --depth 1 --branch v1.90.9 https://github.com/ocornut/imgui.git imgui
-          git clone --depth 1 https://github.com/jmpews/Dobby.git dobby_src
-
-      - name: build dobby (static)
-        run: |
-          cmake -S dobby_src -B dobby_build \
-            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_LATEST_HOME/build/cmake/android.toolchain.cmake \
-            -DANDROID_ABI=$ABI -DANDROID_PLATFORM=android-$API \
-            -DCMAKE_BUILD_TYPE=Release -DDOBBY_GENERATE_SHARED=OFF
-          cmake --build dobby_build -j$(nproc)
-          mkdir -p dobby/include dobby/lib/$ABI
-          cp dobby_src/include/dobby.h dobby/include/
-          cp "$(find dobby_build -name libdobby.a | head -n1)" dobby/lib/$ABI/
+          curl -fsSL -o And64InlineHook.cpp https://raw.githubusercontent.com/Rprop/And64InlineHook/master/And64InlineHook.cpp
+          curl -fsSL -o And64InlineHook.hpp https://raw.githubusercontent.com/Rprop/And64InlineHook/master/And64InlineHook.hpp
 
       - name: build esp
         run: |
@@ -34,7 +24,7 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_LATEST_HOME/build/cmake/android.toolchain.cmake \
             -DANDROID_ABI=$ABI -DANDROID_PLATFORM=android-$API \
             -DCMAKE_BUILD_TYPE=Release \
-            -DIMGUI_DIR=$PWD/imgui -DDOBBY_DIR=$PWD/dobby
+            -DIMGUI_DIR=$PWD/imgui
           cmake --build build -j$(nproc)
           $ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip build/libesp.so
 
