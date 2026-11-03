@@ -17,7 +17,7 @@
 #include <atomic>
 #include "imgui.h"
 #include "backends/imgui_impl_opengl3.h"
-#include "dobby.h"
+#include "And64InlineHook.hpp"
 
 #define LOG(...) __android_log_print(ANDROID_LOG_INFO, "esp", __VA_ARGS__)
 
@@ -348,12 +348,12 @@ static void* MainThread(void*) {
 
     Meth upd = GetM(kPlayerController, "Update", 0);
     if (!upd.fn || !mFindObjs.fn || !mW2S.fn || !mPC_Anim.fn || fAnim_Skel < 0) { LOG("resolve failed, abort"); return nullptr; }
-    DobbyHook(upd.fn, (void*)hk_PC_Update, (void**)&orig_PC_Update);
+    A64HookFunction(upd.fn, (void*)hk_PC_Update, (void**)&orig_PC_Update);
 
     void* egl = dlopen("libEGL.so", RTLD_NOW);
     void* swap = egl ? dlsym(egl, "eglSwapBuffers") : nullptr;
     if (!swap) { LOG("no eglSwapBuffers"); return nullptr; }
-    DobbyHook(swap, (void*)hk_swap, (void**)&orig_swap);
+    A64HookFunction(swap, (void*)hk_swap, (void**)&orig_swap);
     LOG("hooked");
     return nullptr;
 }
