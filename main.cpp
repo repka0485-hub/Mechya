@@ -286,7 +286,14 @@ static void DrawMenu() {
     ImGui::End();
 }
 
+static std::atomic<int> gFrames{0};
+static std::atomic<bool> gReady{false}, gResolving{false};
+static void* ResolveThread(void*);
+
 static EGLBoolean hk_swap(EGLDisplay dpy, EGLSurface surf) {
+    // il2cpp is touched only after the game has rendered ~10s of frames (runtime fully up), never during startup
+    if (gFrames.fetch_add(1) == 600 && !gResolving.exchange(true)) { pthread_t t; pthread_create(&t, nullptr, ResolveThread, nullptr); }
+    if (!gReady) return orig_swap(dpy, surf);
     EGLint w = 0, h = 0; eglQuerySurface(dpy, surf, EGL_WIDTH, &w); eglQuerySurface(dpy, surf, EGL_HEIGHT, &h);
     if (w < 100 || h < 100) return orig_swap(dpy, surf);
     static double last = 0;
@@ -318,16 +325,26 @@ static EGLBoolean hk_swap(EGLDisplay dpy, EGLSurface surf) {
 }
 
 // ---------------------------------------------------------------- bootstrap
-static void* MainThread(void*) {
-    void* h = nullptr;
-    while (!(h = dlopen("libil2cpp.so", RTLD_NOLOAD))) usleep(200000);
+static void* MainThread(void*) { // only hooks eglSwapBuffers (pass-through until ResolveThread is done)
+    void* egl = nullptr;
+    while (!(egl = dlopen("libEGL.so", RTLD_NOW))) usleep(200000);
+    void* swap = dlsym(egl, "eglSwapBuffers");
+    if (!swap) { LOG("no eglSwapBuffers"); return nullptr; }
+    A64HookFunction(swap, (void*)hk_swap, (void**)&orig_swap);
+    LOG("swap hooked");
+    return nullptr;
+}
+
+static void* ResolveThread(void*) {
+    void* h = dlopen("libil2cpp.so", RTLD_NOLOAD);
+    if (!h) { LOG("no libil2cpp"); return nullptr; }
 #define SYM(n) n = (decltype(n))dlsym(h, #n); if (!n) { LOG("sym miss " #n); return nullptr; }
     SYM(il2cpp_domain_get) SYM(il2cpp_thread_attach) SYM(il2cpp_domain_get_assemblies) SYM(il2cpp_assembly_get_image)
     SYM(il2cpp_class_from_name) SYM(il2cpp_class_get_method_from_name) SYM(il2cpp_class_get_field_from_name)
     SYM(il2cpp_field_get_offset) SYM(il2cpp_class_get_type) SYM(il2cpp_type_get_object) SYM(il2cpp_gchandle_new) SYM(il2cpp_gchandle_free)
     // wait for game assemblies
     while (true) { void* d = il2cpp_domain_get(); if (d) { il2cpp_thread_attach(d); if (FindClass("", "PlayerController")) break; } sleep(1); }
-    sleep(3);
+    LOG("il2cpp attached");
 
     kPlayerController = FindClass("", "PlayerController");
     void* kObj = FindClass("UnityEngine", "Object"); void* kComp = FindClass("UnityEngine", "Component");
@@ -349,11 +366,7 @@ static void* MainThread(void*) {
     Meth upd = GetM(kPlayerController, "Update", 0);
     if (!upd.fn || !mFindObjs.fn || !mW2S.fn || !mPC_Anim.fn || fAnim_Skel < 0) { LOG("resolve failed, abort"); return nullptr; }
     A64HookFunction(upd.fn, (void*)hk_PC_Update, (void**)&orig_PC_Update);
-
-    void* egl = dlopen("libEGL.so", RTLD_NOW);
-    void* swap = egl ? dlsym(egl, "eglSwapBuffers") : nullptr;
-    if (!swap) { LOG("no eglSwapBuffers"); return nullptr; }
-    A64HookFunction(swap, (void*)hk_swap, (void**)&orig_swap);
+    gReady = true;
     LOG("hooked");
     return nullptr;
 }
