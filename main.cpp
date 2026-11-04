@@ -9,6 +9,9 @@
 #include <pthread.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <signal.h>
+#include <ucontext.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -87,6 +90,7 @@ namespace Log {
             std::string p = std::string(dirs[i]) + "/esp.log";
             FILE* t = fopen(p.c_str(), "a");
             if (t) { fclose(t); path = p; break; }
+            __android_log_print(ANDROID_LOG_WARN, LOG_TAG, "log dir недоступна: %s (errno %d)", dirs[i], errno);
         }
         openFile();
     }
@@ -588,9 +592,32 @@ static bool InGameProcess() {
     return strstr(b, PKG) != nullptr;
 }
 
+// ловим SIGSEGV/SIGBUS/SIGABRT: пишем addr/pc/lr (модуль+офсет) в лог и отдаём дальше прежнему обработчику
+static struct sigaction g_oldSeg, g_oldBus, g_oldAbrt;
+static void Where(uintptr_t a, char* o, size_t n) {
+    Dl_info d; const char* f;
+    if (dladdr((void*)a, &d) && d.dli_fname) { f = strrchr(d.dli_fname, '/'); snprintf(o, n, "%s+0x%zx", f ? f + 1 : d.dli_fname, (size_t)(a - (uintptr_t)d.dli_fbase)); }
+    else snprintf(o, n, "0x%zx", (size_t)a);
+}
+static void CrashHandler(int sig, siginfo_t* si, void* ucv) {
+    char a[160] = "?", b[160] = "?";
+#if defined(__aarch64__)
+    ucontext_t* uc = (ucontext_t*)ucv;
+    Where(uc->uc_mcontext.pc, a, sizeof a); Where(uc->uc_mcontext.regs[30], b, sizeof b);
+#endif
+    LOGE("SIG%d addr=%p pc=%s lr=%s tid=%d frames=%d upd=%u", sig, si->si_addr, a, b, (int)syscall(SYS_gettid), g_rawFrames.load(), ST.upd.load());
+    sigaction(sig, sig == SIGSEGV ? &g_oldSeg : sig == SIGBUS ? &g_oldBus : &g_oldAbrt, nullptr);   // chain: повторный fault/raise уйдёт старому
+}
+static void InstallCrashHandler() {
+    struct sigaction sa = {}; sa.sa_sigaction = CrashHandler; sa.sa_flags = SA_SIGINFO | SA_ONSTACK; sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, &g_oldSeg); sigaction(SIGBUS, &sa, &g_oldBus); sigaction(SIGABRT, &sa, &g_oldAbrt);
+    LOGI("crash handler установлен");
+}
+
 // фаза 2 (отдельный поток, запускается из hk_swap после PHASE2_FRAMES кадров): il2cpp + хук Update, затем g_active
 static void* Phase2(void*) {
     LOGI("phase2: старт (%d кадров отрендерено)", PHASE2_FRAMES);
+    InstallCrashHandler();                          // после Unity-овских, иначе они нас перекроют
     const char* il = nullptr; int tries = 0;
     while (true) {
         dl_iterate_phdr(PhdrCb, &il);
@@ -637,8 +664,10 @@ static void* Boot(void*) {
     int t = 0; while (!InGameProcess()) { if (++t > 600) return nullptr; usleep(100000); }   // 60с, иначе это не наш процесс
     g_dataDir = std::string("/data/data/") + PKG + "/files";
     mkdir(g_dataDir.c_str(), 0771);
-    const char* dirs[] = {g_dataDir.c_str(), "/data/local/tmp"};
-    Log::init(dirs, 2);
+    std::string selfDir; Dl_info di;                // логи рядом с libesp.so, фолбэк — files/ и /data/local/tmp
+    if (dladdr((void*)&InGameProcess, &di) && di.dli_fname) { std::string p = di.dli_fname; size_t k = p.rfind('/'); if (k != std::string::npos) selfDir = p.substr(0, k); }
+    const char* dirs[] = {selfDir.empty() ? "/data/local/tmp" : selfDir.c_str(), g_dataDir.c_str(), "/data/local/tmp"};
+    Log::init(dirs, 3);
     g_cfgPath = g_dataDir + "/esp.json";
     LOGI("libesp boot pid=%d pkg=%s log=%s", getpid(), PKG, Log::path.c_str());
     CfgLoad();
