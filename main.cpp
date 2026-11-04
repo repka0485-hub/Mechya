@@ -56,43 +56,44 @@ static const char LV_CH[] = {'D', 'I', 'W', 'E'};
 
 namespace Log {
     struct Line { uint64_t ms; uint32_t seq; uint8_t lv; char msg[200]; };
-    static const int RING = 512;
+    static const int RING = 512, NF = 2;     // NF файлов одновременно: рядом с libesp.so и в files/ игры
     static std::mutex mtx;
     static Line ring[RING];
     static uint32_t seq = 0;                 // всего строк; индекс в кольце = seq % RING
-    static FILE* fp = nullptr;
-    static size_t fbytes = 0;
-    static std::string path;
+    static FILE* fp[NF] = {};
+    static size_t fbytes[NF] = {};
+    static std::string paths[NF];
+    static std::string path;                 // для UI: список открытых файлов
     static std::atomic<int> minLevel{LV_I};
     static std::atomic<uint32_t> nWarn{0}, nErr{0};
 
     static void fmtLine(char* out, size_t n, const Line& l) {
         snprintf(out, n, "%7.3f [%c] [%05u] %s\n", (l.ms - g_t0) / 1000.0, LV_CH[l.lv], l.seq, l.msg);
     }
-    static void openFile() {                 // под mtx
-        if (path.empty()) return;
-        fp = fopen(path.c_str(), "w");
-        fbytes = 0;
-        if (!fp) { __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "log open failed: %s (errno %d)", path.c_str(), errno); return; }
-        // дописываем всё, что накопилось до init
-        uint32_t from = seq > (uint32_t)RING ? seq - RING : 0;
+    static void openFile(int i) {            // под mtx
+        if (paths[i].empty()) return;
+        fp[i] = fopen(paths[i].c_str(), "w");
+        fbytes[i] = 0;
+        if (!fp[i]) { __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "log open failed: %s (errno %d)", paths[i].c_str(), errno); return; }
+        uint32_t from = seq > (uint32_t)RING ? seq - RING : 0;   // дописываем всё, что накопилось до init
         char buf[320];
-        for (uint32_t i = from; i < seq; i++) {
-            fmtLine(buf, sizeof buf, ring[i % RING]);
-            fbytes += fwrite(buf, 1, strlen(buf), fp);
-        }
-        fflush(fp);
+        for (uint32_t k = from; k < seq; k++) { fmtLine(buf, sizeof buf, ring[k % RING]); fbytes[i] += fwrite(buf, 1, strlen(buf), fp[i]); }
+        fflush(fp[i]);
     }
-    // dir = каталог с правом записи; пробуем по очереди
+    // dirs — кандидаты по порядку; берём первые NF рабочих
     static void init(const char* const* dirs, int n) {
         std::lock_guard<std::mutex> g(mtx);
-        for (int i = 0; i < n; i++) {
-            std::string p = std::string(dirs[i]) + "/esp.log";
+        int k = 0; path.clear();
+        for (int i = 0; i < n && k < NF; i++) {
+            std::string p = std::string(dirs[i]) + "/esp.log"; bool dup = false;
+            for (int j = 0; j < k; j++) if (paths[j] == p) dup = true;
+            if (dup) continue;
             FILE* t = fopen(p.c_str(), "a");
-            if (t) { fclose(t); path = p; break; }
-            __android_log_print(ANDROID_LOG_WARN, LOG_TAG, "log dir недоступна: %s (errno %d)", dirs[i], errno);
+            if (t) { fclose(t); paths[k++] = p; path += (path.empty() ? "" : " + ") + p; }
+            else __android_log_print(ANDROID_LOG_WARN, LOG_TAG, "log dir недоступна: %s (errno %d)", dirs[i], errno);
         }
-        openFile();
+        for (int i = 0; i < k; i++) openFile(i);
+        if (!k) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "ни одна папка для esp.log не открылась — только logcat (-s esp)");
     }
     static void write(int lv, const char* f, ...) __attribute__((format(printf, 2, 3)));
     static void write(int lv, const char* f, ...) {
@@ -105,15 +106,12 @@ namespace Log {
         std::lock_guard<std::mutex> g(mtx);
         l.seq = seq;
         ring[seq % RING] = l; seq++;
-        if (!fp) return;
         char buf[320]; fmtLine(buf, sizeof buf, l);
-        fbytes += fwrite(buf, 1, strlen(buf), fp);
-        fflush(fp);
-        if (fbytes > (1u << 20)) {
-            fclose(fp); fp = nullptr;
-            std::string old = path + ".1";
-            rename(path.c_str(), old.c_str());
-            openFile();
+        for (int i = 0; i < NF; i++) {
+            if (!fp[i]) continue;
+            fbytes[i] += fwrite(buf, 1, strlen(buf), fp[i]);
+            fflush(fp[i]);
+            if (fbytes[i] > (1u << 20)) { fclose(fp[i]); fp[i] = nullptr; rename(paths[i].c_str(), (paths[i] + ".1").c_str()); openFile(i); }
         }
     }
     static void clear() { std::lock_guard<std::mutex> g(mtx); seq = 0; }
@@ -586,10 +584,15 @@ static int PhdrCb(dl_phdr_info* i, size_t, void* d) {
     if (i->dlpi_name && strstr(i->dlpi_name, "libil2cpp.so")) { *(const char**)d = i->dlpi_name; return 1; }
     return 0;
 }
+static int PhdrUnity(dl_phdr_info* i, size_t, void* d) {
+    if (i->dlpi_name && (strstr(i->dlpi_name, "libunity.so") || strstr(i->dlpi_name, "libil2cpp.so"))) { *(bool*)d = true; return 1; }
+    return 0;
+}
 static bool InGameProcess() {
-    char b[256] = {}; FILE* f = fopen("/proc/self/cmdline", "r"); if (!f) return false;
-    fread(b, 1, sizeof b - 1, f); fclose(f);
-    return strstr(b, PKG) != nullptr;
+    char b[256] = {}; FILE* f = fopen("/proc/self/cmdline", "r");
+    if (f) { fread(b, 1, sizeof b - 1, f); fclose(f); if (strstr(b, PKG)) return true; }
+    bool u = false; dl_iterate_phdr(PhdrUnity, &u);   // cmdline под wrap может быть не пакетом — смотрим по загруженным либам
+    return u;
 }
 
 // ловим SIGSEGV/SIGBUS/SIGABRT: пишем addr/pc/lr (модуль+офсет) в лог и отдаём дальше прежнему обработчику
@@ -661,7 +664,7 @@ static void* Phase2(void*) {
 // фаза 1: только пассивный хук eglSwapBuffers (hk_swap до PHASE2_FRAMES просто пропускает кадр)
 static void* Boot(void*) {
     // LD_PRELOAD отрабатывает до setArgV0 — ждём, пока процесс станет игрой
-    int t = 0; while (!InGameProcess()) { if (++t > 600) return nullptr; usleep(100000); }   // 60с, иначе это не наш процесс
+    int t = 0; while (!InGameProcess()) { if (++t > 600) { char b[128] = {}; if (FILE* f = fopen("/proc/self/cmdline", "r")) { fread(b, 1, sizeof b - 1, f); fclose(f); } __android_log_print(ANDROID_LOG_WARN, LOG_TAG, "не игровой процесс, cmdline=%s", b); return nullptr; } usleep(100000); }
     g_dataDir = std::string("/data/data/") + PKG + "/files";
     mkdir(g_dataDir.c_str(), 0771);
     std::string selfDir; Dl_info di;                // логи рядом с libesp.so, фолбэк — files/ и /data/local/tmp
