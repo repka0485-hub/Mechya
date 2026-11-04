@@ -402,7 +402,7 @@ static void hk_Update(void* self, const void* mi) {
 static bool g_menuOpen = false;
 static bool g_imInit = false;
 static EGLContext g_ctx = EGL_NO_CONTEXT;
-static bool g_attached = false;
+static thread_local bool g_attached = false;   // per-thread: рендер-тред может пересоздаваться (loading->gameplay), новый физический тред без attach = краш в il2cpp GC/TLS
 static ImGuiStyle g_baseStyle; static float g_lastScale = 0.f;
 static bool g_prevDown = false;
 static int g_logLv = LV_D; static bool g_logAuto = true;
