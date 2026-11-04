@@ -619,19 +619,21 @@ static void* Boot(void*) {
     // Update
     Method mu = GetMethod(G.kPlayer, "PlayerController", "Update", 0);
     if (!mu) { LOGE("PlayerController.Update miss — нечего хукать"); return nullptr; }
-    A64HookFunction(mu.fn, (void*)hk_Update, (void**)&orig_Update);
-    LOGI("Update hooked @%p", mu.fn);
+    if (access("/data/local/tmp/esp.noupdate", F_OK) == 0) LOGW("esp.noupdate: Update хук пропущен");
+    else { A64HookFunction(mu.fn, (void*)hk_Update, (void**)&orig_Update); LOGI("Update hooked @%p", mu.fn); }
 
     // eglSwapBuffers
     void* egl = dlopen("libEGL.so", RTLD_NOW);
     void* sw = egl ? dlsym(egl, "eglSwapBuffers") : nullptr;
     if (!sw) { LOGE("no eglSwapBuffers"); return nullptr; }
+    if (access("/data/local/tmp/esp.noswap", F_OK) == 0) { LOGW("esp.noswap: swap хук пропущен"); return nullptr; }
     A64HookFunction(sw, (void*)hk_swap, (void**)&orig_swap);
     LOGI("swap hooked @%p", sw);
     return nullptr;
 }
 
 __attribute__((constructor)) static void Entry() {
+    __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "libesp loaded pid=%d", getpid());
     pthread_t th; pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
     pthread_create(&th, &at, Boot, nullptr);
 }
