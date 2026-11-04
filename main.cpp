@@ -534,10 +534,13 @@ static EGLBoolean hk_swap(EGLDisplay dpy, EGLSurface surf) {
     if (gs && surf != gs) return orig_swap(dpy, surf);   // чужая поверхность (сплеш/видео-загрузка/оверлей) — даже не трогаем eglQuerySurface
 
     EGLContext ctx = eglGetCurrentContext();
+    if (ctx == EGL_NO_CONTEXT) return orig_swap(dpy, surf);              // нет текущего контекста — surface может быть в teardown, не лезем
+    if (eglGetCurrentSurface(EGL_DRAW) != surf) return orig_swap(dpy, surf);   // surf не совпадает с реально забинженной — не наша
+
     EGLint w = 0, h = 0;
     if (!eglQuerySurface(dpy, surf, EGL_WIDTH, &w) || !eglQuerySurface(dpy, surf, EGL_HEIGHT, &h))
-        return orig_swap(dpy, surf);   // поверхность уже дохлая/в процессе teardown — не лезем дальше
-    if (ctx == EGL_NO_CONTEXT || w < 200 || h < 200) return orig_swap(dpy, surf);   // не основной сервейс
+        return orig_swap(dpy, surf);   // запрос не прошёл — не лезем дальше
+    if (w < 200 || h < 200) return orig_swap(dpy, surf);   // не основной сервейс
     if (!gs) { g_gameSurf.store(surf, std::memory_order_release); LOGI("game surface зафиксирована %p %dx%d", surf, w, h); }
 
     if (!g_active.load()) {                          // фаза 1: пассивно, только считаем кадры
