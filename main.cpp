@@ -594,15 +594,27 @@ static void* Boot(void*) {
     LOGI("libil2cpp: %s handle=%p", il, g_il2cpp);
     if (!ResolveApi()) { LOGE("resolve failed, abort"); return nullptr; }
 
-    // ждём, пока il2cpp проинитится и игровой класс станет виден
-    for (tries = 0; ; tries++) {
-        g_domain = il2cpp_domain_get();
-        if (g_domain && BindGame()) break;
-        if (!(tries % 5)) LOGI("ждём классы игры (try %d, domain=%p)", tries, g_domain);
+    // Unity ещё грузит il2cpp: не трогаем API раньше времени (краш на старте = чёрный экран)
+    LOGI("ждём инит il2cpp (8с)"); sleep(8);
+    for (tries = 0; !(g_domain = il2cpp_domain_get()); tries++) {
+        if (tries > 180) { LOGE("il2cpp_domain_get == null, abort"); return nullptr; }
+        sleep(1);
+    }
+    il2cpp_thread_attach(g_domain);                 // ДО любых class_from_name / method_from_name
+    LOGI("domain=%p, thread attached", g_domain);
+    size_t last = 0, stable = 0;                    // ждём, пока список assemblies перестанет расти
+    for (tries = 0; stable < 3; tries++) {
+        size_t n = 0; il2cpp_domain_get_assemblies(g_domain, &n);
+        stable = (n == last && n > 0) ? stable + 1 : 0; last = n;
+        if (tries > 120) { LOGE("assemblies не стабилизировались (n=%zu), abort", n); return nullptr; }
+        sleep(1);
+    }
+    LOGI("assemblies=%zu", last);
+    for (tries = 0; !BindGame(); tries++) {
+        if (!(tries % 5)) LOGI("ждём классы игры (try %d)", tries);
         if (tries > 180) { LOGE("PlayerController не найден за 3 мин, abort"); return nullptr; }
         sleep(1);
     }
-    il2cpp_thread_attach(g_domain);
 
     // Update
     Method mu = GetMethod(G.kPlayer, "PlayerController", "Update", 0);
