@@ -534,7 +534,7 @@ static EGLBoolean hk_swap(EGLDisplay dpy, EGLSurface surf) {
         if (f == PHASE2_FRAMES) {
             pthread_t th; pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
             pthread_create(&th, &at, Phase2, nullptr);
-        } else if (f % 120 == 0) LOGD("passive frames=%d", f);
+        } else if (f % 60 == 0) LOGI("passive frames=%d", f);
         return orig_swap(dpy, surf);
     }
 
@@ -673,6 +673,7 @@ static void* Boot(void*) {
     Log::init(dirs, 3);
     g_cfgPath = g_dataDir + "/esp.json";
     LOGI("libesp boot pid=%d pkg=%s log=%s", getpid(), PKG, Log::path.c_str());
+    InstallCrashHandler();
     CfgLoad();
 
     if (access("/data/local/tmp/esp.noswap", F_OK) == 0) { LOGW("esp.noswap: swap хук пропущен"); return nullptr; }
