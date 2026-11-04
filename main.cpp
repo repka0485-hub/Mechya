@@ -31,6 +31,9 @@
 #include "backends/imgui_impl_opengl3.h"
 
 extern "C" void A64HookFunction(void* symbol, void* replace, void** result);
+// A64HookFunction не гарантирует cache flush на пропатченный адрес на всех девайсах — без него другое
+// ядро/новый тред читает рассинхронизированный i/d-cache и улетает по мусору (pc==addr, в случайный момент).
+static void FlushPatch(void* addr, size_t n = 64) { char* p = (char*)addr; __builtin___clear_cache(p, p + n); }
 
 // ───────────────────────────── config ─────────────────────────────
 #define PKG          "com.ScarletWork.CounterFlame"
@@ -663,7 +666,7 @@ static void* Phase2(void*) {
     Method mu = GetMethod(G.kPlayer, "PlayerController", "Update", 0);
     if (!mu) { LOGE("PlayerController.Update miss — нечего хукать"); return nullptr; }
     if (access("/data/local/tmp/esp.noupdate", F_OK) == 0) LOGW("esp.noupdate: Update хук пропущен");
-    else { A64HookFunction(mu.fn, (void*)hk_Update, (void**)&orig_Update); LOGI("Update hooked @%p", mu.fn); }
+    else { A64HookFunction(mu.fn, (void*)hk_Update, (void**)&orig_Update); FlushPatch(mu.fn); LOGI("Update hooked @%p", mu.fn); }
     g_active = true;                                // с этого момента swap-хук рисует меню/ESP
     LOGI("active: меню включено");
     return nullptr;
@@ -689,6 +692,7 @@ static void* Boot(void*) {
     void* sw = egl ? dlsym(egl, "eglSwapBuffers") : nullptr;
     if (!sw) { LOGE("no eglSwapBuffers"); return nullptr; }
     A64HookFunction(sw, (void*)hk_swap, (void**)&orig_swap);
+    FlushPatch(sw);
     LOGI("swap hooked @%p (пассивно, phase2 через %d кадров)", sw, PHASE2_FRAMES);
     return nullptr;
 }
