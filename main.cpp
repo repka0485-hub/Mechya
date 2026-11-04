@@ -189,6 +189,8 @@ static size_t (*il2cpp_field_get_offset)(void*);
 static void* (*il2cpp_thread_attach)(void*);
 static const void* (*il2cpp_method_get_return_type)(void*);
 static int (*il2cpp_type_get_type)(const void*);
+static void (*il2cpp_thread_detach)(void*);
+struct ThreadDetach { void* t; ~ThreadDetach() { if (t && il2cpp_thread_detach) il2cpp_thread_detach(t); } };   // поток умер attached = краш GC на скане стека
 
 static void* g_il2cpp = nullptr;
 static void* g_domain = nullptr;
@@ -201,6 +203,8 @@ static bool ResolveApi() {
     SYM(il2cpp_field_get_offset); SYM(il2cpp_thread_attach);
     *(void**)&il2cpp_method_get_return_type = dlsym(g_il2cpp, "il2cpp_method_get_return_type"); // опционально
     *(void**)&il2cpp_type_get_type = dlsym(g_il2cpp, "il2cpp_type_get_type");
+    *(void**)&il2cpp_thread_detach = dlsym(g_il2cpp, "il2cpp_thread_detach");
+    if (!il2cpp_thread_detach) LOGW("sym miss il2cpp_thread_detach");
     #undef SYM
     return ok;
 }
@@ -602,8 +606,8 @@ static void* Phase2(void*) {
         if (tries > 60) { LOGE("il2cpp_domain_get == null, abort"); return nullptr; }
         sleep(1);
     }
-    il2cpp_thread_attach(g_domain);                 // ДО любых class_from_name / method_from_name
-    LOGI("il2cpp attached domain=%p", g_domain);
+    ThreadDetach td{il2cpp_thread_attach(g_domain)};   // ДО любых class_from_name; detach на выходе из Phase2
+    LOGI("il2cpp attached domain=%p thread=%p", g_domain, td.t);
     size_t last = 0, stable = 0;                    // ждём, пока список assemblies перестанет расти
     for (tries = 0; stable < 3; tries++) {
         size_t n = 0; il2cpp_domain_get_assemblies(g_domain, &n);
