@@ -523,11 +523,19 @@ static void* Phase2(void*);
 static std::atomic<bool> g_active{false};
 static std::atomic<int> g_rawFrames{0};
 static EGLBoolean (*orig_swap)(EGLDisplay, EGLSurface);
+static std::atomic<EGLSurface> g_gameSurf{(EGLSurface)nullptr};   // зафиксированная игровая поверхность; всё остальное — чистый passthrough
 static EGLBoolean hk_swap(EGLDisplay dpy, EGLSurface surf) {
+    if (dpy == EGL_NO_DISPLAY || surf == EGL_NO_SURFACE) return orig_swap(dpy, surf);
+
+    EGLSurface gs = g_gameSurf.load(std::memory_order_acquire);
+    if (gs && surf != gs) return orig_swap(dpy, surf);   // чужая поверхность (сплеш/видео-загрузка/оверлей) — даже не трогаем eglQuerySurface
+
     EGLContext ctx = eglGetCurrentContext();
     EGLint w = 0, h = 0;
-    eglQuerySurface(dpy, surf, EGL_WIDTH, &w); eglQuerySurface(dpy, surf, EGL_HEIGHT, &h);
+    if (!eglQuerySurface(dpy, surf, EGL_WIDTH, &w) || !eglQuerySurface(dpy, surf, EGL_HEIGHT, &h))
+        return orig_swap(dpy, surf);   // поверхность уже дохлая/в процессе teardown — не лезем дальше
     if (ctx == EGL_NO_CONTEXT || w < 200 || h < 200) return orig_swap(dpy, surf);   // не основной сервейс
+    if (!gs) { g_gameSurf.store(surf, std::memory_order_release); LOGI("game surface зафиксирована %p %dx%d", surf, w, h); }
 
     if (!g_active.load()) {                          // фаза 1: пассивно, только считаем кадры
         int f = ++g_rawFrames;
