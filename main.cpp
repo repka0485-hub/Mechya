@@ -37,6 +37,7 @@ extern "C" void A64HookFunction(void* symbol, void* replace, void** result);
 #define MAX_HP       100.0f    // FILL: максимум HP для полоски
 #define STALE_MS     150       // снапшот старше — не рисуем
 #define DROP_MS      2000      // старше — удаляем
+#define PHASE2_FRAMES 600      // ~10с рендера до первого касания il2cpp
 
 // ───────────────────────────── time ─────────────────────────────
 static uint64_t NowMs() {
@@ -512,12 +513,24 @@ static void DrawMenu() {
     ImGui::End();
 }
 
+static void* Phase2(void*);
+static std::atomic<bool> g_active{false};
+static std::atomic<int> g_rawFrames{0};
 static EGLBoolean (*orig_swap)(EGLDisplay, EGLSurface);
 static EGLBoolean hk_swap(EGLDisplay dpy, EGLSurface surf) {
     EGLContext ctx = eglGetCurrentContext();
     EGLint w = 0, h = 0;
     eglQuerySurface(dpy, surf, EGL_WIDTH, &w); eglQuerySurface(dpy, surf, EGL_HEIGHT, &h);
     if (ctx == EGL_NO_CONTEXT || w < 200 || h < 200) return orig_swap(dpy, surf);   // не основной сервейс
+
+    if (!g_active.load()) {                          // фаза 1: пассивно, только считаем кадры
+        int f = ++g_rawFrames;
+        if (f == PHASE2_FRAMES) {
+            pthread_t th; pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+            pthread_create(&th, &at, Phase2, nullptr);
+        } else if (f % 120 == 0) LOGD("passive frames=%d", f);
+        return orig_swap(dpy, surf);
+    }
 
     if (!g_imInit) {
         IMGUI_CHECKVERSION(); ImGui::CreateContext();
@@ -571,6 +584,50 @@ static bool InGameProcess() {
     return strstr(b, PKG) != nullptr;
 }
 
+// фаза 2 (отдельный поток, запускается из hk_swap после PHASE2_FRAMES кадров): il2cpp + хук Update, затем g_active
+static void* Phase2(void*) {
+    LOGI("phase2: старт (%d кадров отрендерено)", PHASE2_FRAMES);
+    const char* il = nullptr; int tries = 0;
+    while (true) {
+        dl_iterate_phdr(PhdrCb, &il);
+        if (il) { g_il2cpp = dlopen(il, RTLD_NOW | RTLD_NOLOAD); if (g_il2cpp) break; }
+        if (!(tries++ % 20)) LOGI("no libil2cpp (try %d)", tries);
+        if (tries > 600) { LOGE("libil2cpp так и не появилась, abort"); return nullptr; }
+        usleep(100000);
+    }
+    LOGI("libil2cpp: %s handle=%p", il, g_il2cpp);
+    if (!ResolveApi()) { LOGE("resolve failed, abort"); return nullptr; }
+
+    for (tries = 0; !(g_domain = il2cpp_domain_get()); tries++) {
+        if (tries > 60) { LOGE("il2cpp_domain_get == null, abort"); return nullptr; }
+        sleep(1);
+    }
+    il2cpp_thread_attach(g_domain);                 // ДО любых class_from_name / method_from_name
+    LOGI("il2cpp attached domain=%p", g_domain);
+    size_t last = 0, stable = 0;                    // ждём, пока список assemblies перестанет расти
+    for (tries = 0; stable < 3; tries++) {
+        size_t n = 0; il2cpp_domain_get_assemblies(g_domain, &n);
+        stable = (n == last && n > 0) ? stable + 1 : 0; last = n;
+        if (tries > 60) { LOGE("assemblies не стабилизировались (n=%zu), abort", n); return nullptr; }
+        sleep(1);
+    }
+    LOGI("assemblies=%zu", last);
+    for (tries = 0; !BindGame(); tries++) {
+        if (!(tries % 5)) LOGI("ждём классы игры (try %d)", tries);
+        if (tries > 180) { LOGE("PlayerController не найден за 3 мин, abort"); return nullptr; }
+        sleep(1);
+    }
+
+    Method mu = GetMethod(G.kPlayer, "PlayerController", "Update", 0);
+    if (!mu) { LOGE("PlayerController.Update miss — нечего хукать"); return nullptr; }
+    if (access("/data/local/tmp/esp.noupdate", F_OK) == 0) LOGW("esp.noupdate: Update хук пропущен");
+    else { A64HookFunction(mu.fn, (void*)hk_Update, (void**)&orig_Update); LOGI("Update hooked @%p", mu.fn); }
+    g_active = true;                                // с этого момента swap-хук рисует меню/ESP
+    LOGI("active: меню включено");
+    return nullptr;
+}
+
+// фаза 1: только пассивный хук eglSwapBuffers (hk_swap до PHASE2_FRAMES просто пропускает кадр)
 static void* Boot(void*) {
     // LD_PRELOAD отрабатывает до setArgV0 — ждём, пока процесс станет игрой
     int t = 0; while (!InGameProcess()) { if (++t > 600) return nullptr; usleep(100000); }   // 60с, иначе это не наш процесс
@@ -582,53 +639,12 @@ static void* Boot(void*) {
     LOGI("libesp boot pid=%d pkg=%s log=%s", getpid(), PKG, Log::path.c_str());
     CfgLoad();
 
-    // libil2cpp.so
-    const char* il = nullptr; int tries = 0;
-    while (true) {
-        dl_iterate_phdr(PhdrCb, &il);
-        if (il) { g_il2cpp = dlopen(il, RTLD_NOW | RTLD_NOLOAD); if (g_il2cpp) break; }
-        if (!(tries++ % 20)) LOGI("no libil2cpp (try %d)", tries);
-        if (tries > 1200) { LOGE("libil2cpp так и не появилась, abort"); return nullptr; }
-        usleep(100000);
-    }
-    LOGI("libil2cpp: %s handle=%p", il, g_il2cpp);
-    if (!ResolveApi()) { LOGE("resolve failed, abort"); return nullptr; }
-
-    // Unity ещё грузит il2cpp: не трогаем API раньше времени (краш на старте = чёрный экран)
-    LOGI("ждём инит il2cpp (8с)"); sleep(8);
-    for (tries = 0; !(g_domain = il2cpp_domain_get()); tries++) {
-        if (tries > 180) { LOGE("il2cpp_domain_get == null, abort"); return nullptr; }
-        sleep(1);
-    }
-    il2cpp_thread_attach(g_domain);                 // ДО любых class_from_name / method_from_name
-    LOGI("domain=%p, thread attached", g_domain);
-    size_t last = 0, stable = 0;                    // ждём, пока список assemblies перестанет расти
-    for (tries = 0; stable < 3; tries++) {
-        size_t n = 0; il2cpp_domain_get_assemblies(g_domain, &n);
-        stable = (n == last && n > 0) ? stable + 1 : 0; last = n;
-        if (tries > 120) { LOGE("assemblies не стабилизировались (n=%zu), abort", n); return nullptr; }
-        sleep(1);
-    }
-    LOGI("assemblies=%zu", last);
-    for (tries = 0; !BindGame(); tries++) {
-        if (!(tries % 5)) LOGI("ждём классы игры (try %d)", tries);
-        if (tries > 180) { LOGE("PlayerController не найден за 3 мин, abort"); return nullptr; }
-        sleep(1);
-    }
-
-    // Update
-    Method mu = GetMethod(G.kPlayer, "PlayerController", "Update", 0);
-    if (!mu) { LOGE("PlayerController.Update miss — нечего хукать"); return nullptr; }
-    if (access("/data/local/tmp/esp.noupdate", F_OK) == 0) LOGW("esp.noupdate: Update хук пропущен");
-    else { A64HookFunction(mu.fn, (void*)hk_Update, (void**)&orig_Update); LOGI("Update hooked @%p", mu.fn); }
-
-    // eglSwapBuffers
+    if (access("/data/local/tmp/esp.noswap", F_OK) == 0) { LOGW("esp.noswap: swap хук пропущен"); return nullptr; }
     void* egl = dlopen("libEGL.so", RTLD_NOW);
     void* sw = egl ? dlsym(egl, "eglSwapBuffers") : nullptr;
     if (!sw) { LOGE("no eglSwapBuffers"); return nullptr; }
-    if (access("/data/local/tmp/esp.noswap", F_OK) == 0) { LOGW("esp.noswap: swap хук пропущен"); return nullptr; }
     A64HookFunction(sw, (void*)hk_swap, (void**)&orig_swap);
-    LOGI("swap hooked @%p", sw);
+    LOGI("swap hooked @%p (пассивно, phase2 через %d кадров)", sw, PHASE2_FRAMES);
     return nullptr;
 }
 
